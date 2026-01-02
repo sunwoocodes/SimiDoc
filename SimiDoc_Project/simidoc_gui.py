@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QTextEdit, QSplitter, QFileDialog, QFrame,
     QMessageBox
 )
-from PyQt6.QtCore import Qt, QSize, QDateTime
+from PyQt6.QtCore import Qt, QSize, QDateTime, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPalette
 
 
@@ -259,6 +259,22 @@ class ParagraphListItem(QWidget):
         palette.setColor(QPalette.ColorRole.WindowText, color)
         self.rate_label.setPalette(palette)
 
+# 분석 작업을 백그라운드에서 실행하기 위한 워커 쓰레드
+class AnalysisWorker(QThread):
+    # 분석 완료 시 결과 데이터, 타겟 ID, 파일명을 메인 쓰레드로 전달하는 신호
+    finished = pyqtSignal(list, int, str)
+
+    def __init__(self, analyzer, target_pdf_id, file_name_only, files_data):
+        super().__init__()
+        self.analyzer = analyzer
+        self.target_pdf_id = target_pdf_id
+        self.file_name_only = file_name_only
+        self.files_data = files_data
+
+    def run(self):
+        # 여기가 실질적으로 시간이 오래 걸리는 작업 (백그라운드 실행)
+        results = self.analyzer.analyze_similarity(self.target_pdf_id, self.files_data)
+        self.finished.emit(results, self.target_pdf_id, self.file_name_only)
 
 # --- 메인 윈도우 클래스 ---
 class MainWindow(QWidget):
@@ -699,84 +715,80 @@ class MainWindow(QWidget):
             target_pdf_id = self.files_data[selected_pdf_index]["id"]
             file_name_only = self.files_data[selected_pdf_index]["file_name_only"]
 
-            print(f"DEBUG(AnalyzeFile): Starting analysis for PDF ID: {target_pdf_id}, Name: {file_name_only}")
-            self.text_comparison.setPlainText(f"'{file_name_only}' 파일에 대해 유사도 분석을 시작합니다...\n\n")
-            QApplication.processEvents() # GUI 업데이트 강제 (로딩 메시지 표시용)
+            # 1. UI 최적화: 사용자가 기다리는 동안 피드백 제공
+            self.text_comparison.setPlainText(f"⏳ '{file_name_only}' 파일 분석 중...\n(잠시만 기다려주세요...)")
+            self.btn_analyze.setEnabled(False) # 중복 실행 방지
+            self.btn_analyze.setText("분석 중...") 
 
-            analysis_results = self.analyzer.analyze_similarity(target_pdf_id, self.files_data)
-            
-            # 분석 결과를 캐시에 저장 (수정 없음)
-            self._cached_pdf_id = target_pdf_id
-            self._cached_paragraph_plagiarism_rates = {} # 분석할 때마다 캐시 새로 채움
-            for res in analysis_results:
-                target_para_order = res['target_paragraph'][2]
-                highest_plagiarism_score = 0.0
-                if res['similar_paragraphs']:
-                    highest_plagiarism_score = max(sp['similarity'] for sp in res['similar_paragraphs'])
-                self._cached_paragraph_plagiarism_rates[(target_pdf_id, target_para_order)] = highest_plagiarism_score
-            print(f"DEBUG(AnalyzeFile): Analysis complete. Cached PDF ID: {self._cached_pdf_id}, rates={len(self._cached_paragraph_plagiarism_rates)}")
+            # 2. 성능 최적화: 워커 쓰레드 생성 및 실행 (GUI 멈춤 방지)
+            self.worker = AnalysisWorker(self.analyzer, target_pdf_id, file_name_only, self.files_data)
+            self.worker.finished.connect(self.on_analysis_complete) # 작업이 끝나면 실행될 함수 연결
+            self.worker.start()
 
-
-            if analysis_results:
-                result_text = f"--- '{file_name_only}' 유사도 분석 결과 ---\n\n"
-                for res in analysis_results:
-                    target_para_order = res['target_paragraph'][2]
-                    target_para_text_preview = res['target_paragraph'][1][:100]
-
-                    # 문단별 표절율 (캐시된 값 사용 또는 다시 계산)
-                    highest_plagiarism_score = self._cached_paragraph_plagiarism_rates.get((target_pdf_id, target_para_order), 0.0)
-
-                    # 표절율 점수에 따라 색상 강조
-                    plagiarism_color = "#90EE90" # 기본값: 낮음 (녹색)
-                    if highest_plagiarism_score >= 0.8:
-                        plagiarism_color = "#FF4444" # 매우 높음 (빨간색)
-                    elif highest_plagiarism_score >= 0.5:
-                        plagiarism_color = "#FFA500" # 주황색 (중간)
-                    
-                    result_text += (
-                        f"▪️ 타겟 문단 [{target_para_order}] "
-                        f"(<span style='color:{plagiarism_color}; font-weight:bold;'>표절율: {highest_plagiarism_score*100:.0f}%</span>): "
-                        f"{target_para_text_preview}...\n"
-                    )
-                    
-                    if res['similar_paragraphs']:
-                        for sim_para in res['similar_paragraphs']:
-                            source_pdf_id = sim_para['source_pdf_id']
-                            # files_data가 없을 때를 대비하여 next 함수에서 기본값 "알 수 없음"을 반환
-                            source_pdf_name = next((f["file_name_only"] for f in self.files_data if f["id"] == source_pdf_id), "알 수 없음")
-                            source_para_order = sim_para['source_paragraph'][2]
-                            source_para_text_preview = sim_para['source_paragraph'][1][:100]
-                            similarity = sim_para['similarity']
-                            
-                            # 유사도 점수에 따라 색상 강조 (기존과 동일)
-                            if similarity > 0.8:
-                                color_code = "#90EE90" # 밝은 녹색 (높음)
-                            elif similarity > 0.5:
-                                color_code = "#FFFF00" # 노란색 (중간)
-                            else:
-                                color_code = "#FF6347" # 토마토색 (낮음)
-                            
-                            result_text += (
-                                f"  <span style='color:{color_code}; font-weight:bold;'>[유사도: {similarity:.2f}]</span> "
-                                f"PDF '{source_pdf_name}'의 문단 [{source_para_order}]: "
-                                f"{source_para_text_preview}...\n"
-                            )
-                    else:
-                        result_text += "  유사한 다른 문단을 찾을 수 없습니다.\n"
-                    result_text += "\n"
-                self.text_comparison.setHtml(result_text)
-            else:
-                self.text_comparison.setPlainText(f"'{file_name_only}' 파일에 대한 유사도 분석 결과가 없습니다. "
-                                                  "충분한 데이터가 없거나 유사 문단이 발견되지 않았습니다.")
-            
-            # 분석이 완료되었으니 중앙 문단 목록 갱신 (표절율 반영)
-            # 현재 선택된 PDF 아이템을 다시 가져와서 _on_pdf_selection_changed를 트리거
-            current_pdf_item = self.file_list_widget.currentItem()
-            if current_pdf_item:
-                print(f"DEBUG(AnalyzeFile): Triggering _on_pdf_selection_changed after analysis.")
-                self._on_pdf_selection_changed(current_pdf_item, None) # previous_item은 필요 없으므로 None
         else:
             self.text_comparison.setPlainText("선택된 파일이 올바르지 않습니다.")
+
+    # [추가] 쓰레드 작업이 완료되었을 때 호출되는 함수 (결과 화면 표시)
+    def on_analysis_complete(self, analysis_results, target_pdf_id, file_name_only):
+        self.btn_analyze.setEnabled(True) # 버튼 다시 활성화
+        self.btn_analyze.setText("✨ 분석하기")
+
+        # 캐시 업데이트 (기존 로직 재사용)
+        self._cached_pdf_id = target_pdf_id
+        self._cached_paragraph_plagiarism_rates = {} 
+        for res in analysis_results:
+            target_para_order = res['target_paragraph'][2]
+            # 리스트 컴프리헨션 최적화
+            scores = [sp['similarity'] for sp in res['similar_paragraphs']]
+            highest_score = max(scores) if scores else 0.0
+            self._cached_paragraph_plagiarism_rates[(target_pdf_id, target_para_order)] = highest_score
+        
+        # 결과 텍스트 생성 (HTML)
+        if not analysis_results:
+            self.text_comparison.setPlainText(f"'{file_name_only}'에 대한 유사도 분석 결과가 없습니다.")
+        else:
+            result_lines = [f"--- '{file_name_only}' 유사도 분석 결과 ---\n"]
+            
+            for res in analysis_results:
+                t_order = res['target_paragraph'][2]
+                t_text = res['target_paragraph'][1][:100]
+                score = self._cached_paragraph_plagiarism_rates.get((target_pdf_id, t_order), 0.0)
+
+                # 색상 결정 로직 간소화
+                color = "#FF4444" if score >= 0.8 else "#FFA500" if score >= 0.5 else "#90EE90"
+                
+                result_lines.append(
+                    f"▪️ 타겟 문단 [{t_order}] "
+                    f"(<span style='color:{color}; font-weight:bold;'>표절율: {score*100:.0f}%</span>): "
+                    f"{t_text}...\n"
+                )
+                
+                if res['similar_paragraphs']:
+                    for sim in res['similar_paragraphs']:
+                        s_id = sim['source_pdf_id']
+                        # 파일명 찾기 최적화 (generator expression)
+                        s_name = next((f["file_name_only"] for f in self.files_data if f["id"] == s_id), "알 수 없음")
+                        s_order = sim['source_paragraph'][2]
+                        s_text = sim['source_paragraph'][1][:100]
+                        sim_score = sim['similarity']
+                        
+                        sim_color = "#90EE90" if sim_score > 0.8 else "#FFFF00" if sim_score > 0.5 else "#FF6347"
+                        
+                        result_lines.append(
+                            f"  <span style='color:{sim_color}; font-weight:bold;'>[유사도: {sim_score:.2f}]</span> "
+                            f"PDF '{s_name}' [{s_order}]: {s_text}...\n"
+                        )
+                else:
+                    result_lines.append("  유사한 문단 없음.\n")
+                
+                result_lines.append("\n")
+            
+            self.text_comparison.setHtml("".join(result_lines))
+        
+        # 리스트 뷰 갱신 (표절율 색상 반영)
+        current_pdf_item = self.file_list_widget.currentItem()
+        if current_pdf_item:
+            self._on_pdf_selection_changed(current_pdf_item, None)
 
     def _open_compare_view(self):
         """'비교 문서 보기' 버튼 클릭 시 실행될 함수 (현재는 더미)"""
