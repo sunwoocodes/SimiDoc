@@ -510,9 +510,17 @@ class MainWindow(QWidget):
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            
+            # [수정] 외래키 설정(CASCADE)에 의존하지 않고, 명시적으로 문단 데이터를 먼저 삭제.
+            # 고아 데이터가 남는 문제 방지가능.
+            cursor.execute("DELETE FROM paragraphs WHERE pdf_id = ?", (pdf_id,))
+            
+            # 그 다음 PDF 파일 정보를 삭제합니다.
             cursor.execute("DELETE FROM pdfs WHERE id = ?", (pdf_id,))
+            
             conn.commit()
-            print(f"DEBUG(DeleteDB): Deleted PDF with ID: {pdf_id}") # 디버그
+            print(f"DEBUG(DeleteDB): Deleted PDF and its paragraphs with ID: {pdf_id}")
+            
         except sqlite3.Error as e:
             QMessageBox.critical(self, "데이터 삭제 오류", f"데이터베이스에서 PDF를 삭제하는 중 오류 발생: {e}")
         finally:
